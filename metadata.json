@@ -1,0 +1,8 @@
+{
+  "name": "Remix: UnitShift",
+  "description": "A minimalist, high-speed unit converter for length, weight, temperature, time, and volume. Features offline history and favorites.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": []
+}
