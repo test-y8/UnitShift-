@@ -31,6 +31,7 @@ import {
   Zap
 } from 'lucide-react';
 import { CATEGORIES, convertValue, HistoryItem, Category, Unit } from './constants';
+import { GoogleGenAI, Type } from "@google/genai";
 
 // Extension for Web Speech API
 declare global {
@@ -50,50 +51,128 @@ const ICON_MAP: Record<string, any> = {
   Zap
 };
 
+// Initialize Gemini API safely
+const getAiInstance = () => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key || key === "MY_GEMINI_API_KEY" || !key.trim()) return null;
+    return new GoogleGenAI({ apiKey: key });
+  } catch (e) {
+    console.error("Failed to initialize AI instance:", e);
+    return null;
+  }
+};
+
+const ai = getAiInstance();
+
 // Local Smart Parser - Replaces Gemini AI with local logic
 const smartParseQuery = (query: string, allCats: Category[]) => {
-  const q = query.toLowerCase().trim();
+  const q = query.toLowerCase().trim().replace(/[?!,.]$/, '');
+  const normalize = (s: string) => s.toLowerCase().replace(/s$/, '').trim();
+
+  // 1. Identify Target Unit First (searching from the end usually helps)
+  const splitters = [/\s+(?:to|in|into|as)\s+/, /\s*=\s*/, /\s+is\s+/, /how many (.*?) in (.*)/i];
+  let left = '';
+  let right = '';
   
-  // Pattern 1: Look for "5 km to miles" or "convert 10 kg in lbs"
-  const conversionRegex = /^(?:convert\s+)?(-?\d*\.?\d+)\s*(.*?)\s+(?:to|in|into)\s+(.*)$/i;
-  const match = q.match(conversionRegex);
+  // Try "How many X in Y" pattern specifically
+  const howManyMatch = q.match(/^how\s+many\s+(.*?)\s+(?:are\s+)?in\s+(.*)$/i);
+  if (howManyMatch) {
+    right = howManyMatch[1].trim();
+    left = howManyMatch[2].trim();
+  } else {
+    for (const s of splitters) {
+      const parts = q.split(s);
+      if (parts.length >= 2) {
+        // Everything before the last splitter is the source
+        left = parts.slice(0, -1).join(' ').trim();
+        right = parts[parts.length - 1].trim();
+        break;
+      }
+    }
+  }
 
-  if (match) {
-    const value = parseFloat(match[1]);
-    const fromStr = match[2].trim();
-    const toStr = match[3].trim();
+  if (left && right) {
+    // 2. Identify the target category and unit
+    let targetUnit: Unit | null = null;
+    let targetCat: Category | null = null;
 
-    // Search for matching units across all categories
     for (const cat of allCats) {
-      const fromUnit = cat.units.find(u => 
-        u.value.toLowerCase() === fromStr || 
-        u.label.toLowerCase().includes(fromStr) ||
-        (u.symbol && u.symbol.toLowerCase() === fromStr)
+      const found = cat.units.find(u => 
+        normalize(u.value) === normalize(right) || 
+        normalize(u.label).includes(normalize(right)) ||
+        (u.symbol && normalize(u.symbol) === normalize(right))
       );
-      const toUnit = cat.units.find(u => 
-        u.value.toLowerCase() === toStr || 
-        u.label.toLowerCase().includes(toStr) ||
-        (u.symbol && u.symbol.toLowerCase() === toStr)
-      );
+      if (found) {
+        targetUnit = found;
+        targetCat = cat;
+        break;
+      }
+    }
 
-      if (fromUnit && toUnit) {
+    if (targetCat && targetUnit) {
+      // 3. Scan the Left side for multiple value-unit pairs in this category
+      // Look for patterns like "5 feet", "6 inches", "10kg", etc.
+      const chunkRegex = /(-?\d*\.?\d+)\s*([a-zA-Z%°Åµ]*)/g;
+      let m;
+      let totalValueInBase = 0;
+      const parsedFound: { val: number; unit: Unit }[] = [];
+
+      while ((m = chunkRegex.exec(left)) !== null) {
+        const val = parseFloat(m[1]);
+        const unitStr = m[2].trim();
+        if (!isNaN(val)) {
+          const unit = targetCat.units.find(u => 
+            normalize(u.value) === normalize(unitStr) || 
+            normalize(u.label).includes(normalize(unitStr)) ||
+            (u.symbol && normalize(u.symbol) === normalize(unitStr))
+          );
+          
+          if (unit) {
+            // Temperature is special
+            if (targetCat.id === 'temperature') {
+              let cVal = val;
+              if (unit.value === 'f') cVal = (val - 32) * (5 / 9);
+              if (unit.value === 'k') cVal = val - 273.15;
+              if (unit.value === 'r') cVal = (val - 491.67) * (5 / 9);
+              totalValueInBase = cVal; // Temps don't sum, we just take the last one found
+            } else {
+              totalValueInBase += val * unit.ratio;
+            }
+            parsedFound.push({ val, unit });
+          }
+        }
+      }
+
+      if (parsedFound.length > 0) {
+        // Result: Convert from base to target
+        const finalValue = targetCat.id === 'temperature' 
+          ? totalValueInBase // Temperate base is handled in convertValue
+          : totalValueInBase / (targetCat.units.find(u => u.value === targetCat?.baseUnit)?.ratio || 1);
+
+        // If multi-unit, provide an explanation and set state to base unit
+        const displaySource = parsedFound.map(p => `${p.val} ${p.unit.label.split('(')[0].trim()}`).join(' + ');
+        
         return {
-          category: cat.id,
-          fromUnit: fromUnit.value,
-          toUnit: toUnit.value,
-          value,
-          explanation: `Locally parsed: ${value} ${fromUnit.label.split('(')[0]} to ${toUnit.label.split('(')[0]}`
+          category: targetCat.id,
+          // If only one unit found, use it. If multiple, use the first one and adjust value for state UI
+          fromUnit: parsedFound[0].unit.value,
+          toUnit: targetUnit.value,
+          value: targetCat.id === 'temperature' 
+            ? parsedFound[0].val // Keep temp as is
+            : (totalValueInBase / parsedFound[0].unit.ratio), // Scale first unit value to match total
+          explanation: `Locally parsed: ${displaySource} → ${targetUnit.label.split('(')[0].trim()}`
         };
       }
     }
   }
 
-  // Pattern 2: Search for category names
+  // Fallback pattern for simple category search
   for (const cat of allCats) {
     if (q.includes(cat.label.toLowerCase()) || q.includes(cat.id)) {
       return {
         category: cat.id,
-        explanation: `Switched to ${cat.label} category based on your search.`
+        explanation: `Switched to ${cat.label} category.`
       };
     }
   }
@@ -270,8 +349,47 @@ export default function App() {
     setIsProcessing(true);
     setSmartResult(null);
 
-    // Using the local smart parser
-    const data = smartParseQuery(queryToProcess, allCategories);
+    let data: any = null;
+
+    if (ai) {
+      try {
+        const result = await ai.models.generateContent({
+          model: "gemini-3-flash-preview",
+          contents: `User wants to convert units or ask about units. Query: "${queryToProcess}"
+          
+          Available Units Context:
+          ${CATEGORIES.map(c => `${c.label} (${c.id}): ${c.units.map(u => u.label + ' [' + u.value + ']').join(', ')}`).join('\n')}
+          
+          Task:
+          1. If it's a specific conversion request (e.g. "5m to ft"), parse numerical value, category ID, source unit key, and target unit key.
+          2. Provide a brief (1 sentence) explanation, comparison, or fun fact about the unit or conversion.
+          3. Map the units strictly to the valid 'value' keys provided in context.`,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                category: { type: Type.STRING },
+                fromUnit: { type: Type.STRING },
+                toUnit: { type: Type.STRING },
+                value: { type: Type.NUMBER },
+                explanation: { type: Type.STRING }
+              },
+              required: ["explanation"]
+            }
+          }
+        });
+        const text = result.text;
+        if (text) data = JSON.parse(text);
+      } catch (err) {
+        console.error("AI Error, falling back to local search:", err);
+      }
+    }
+
+    // Fallback to local if AI is not available or failed
+    if (!data) {
+      data = smartParseQuery(queryToProcess, allCategories);
+    }
     
     if (data) {
       setSmartResult(data);
