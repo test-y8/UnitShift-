@@ -51,30 +51,62 @@ const ICON_MAP: Record<string, any> = {
   Zap
 };
 
-// Initialize Gemini API
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// Initialize Gemini API safely
+const getAiInstance = () => {
+  try {
+    const key = import.meta.env.VITE_GEMINI_API_KEY || (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '');
+    if (!key || key === "MY_GEMINI_API_KEY" || !key.trim()) return null;
+    return new GoogleGenAI({ apiKey: key });
+  } catch (e) {
+    console.error("Failed to initialize AI instance:", e);
+    return null;
+  }
+};
+
+const ai = getAiInstance();
+
+const generateId = () => {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return crypto.randomUUID();
+    }
+  } catch (e) {}
+  return Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+};
 
 export default function App() {
-  const [activeCategoryId, setActiveCategoryId] = useState(CATEGORIES[0].id);
+  const [activeCategoryId, setActiveCategoryId] = useState(() => CATEGORIES[0]?.id || '');
   const [inputValue, setInputValue] = useState<string>('1');
   const [isDarkMode, setIsDarkMode] = useState(() => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem('theme') === 'dark' || 
-        (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    try {
+      if (typeof window !== 'undefined') {
+        return localStorage.getItem('theme') === 'dark' || 
+          (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      }
+    } catch (e) {
+      return false;
     }
     return false;
   });
   const [history, setHistory] = useState<HistoryItem[]>(() => {
-    if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('unitshift_history');
-      return saved ? JSON.parse(saved) : [];
+    try {
+      if (typeof window !== 'undefined') {
+        const saved = localStorage.getItem('unitshift_history');
+        return saved ? JSON.parse(saved) : [];
+      }
+    } catch (e) {
+      return [];
     }
     return [];
   });
   const [favorites, setFavorites] = useState<HistoryItem[]>(() => {
-    if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('unitshift_favorites');
-      return saved ? JSON.parse(saved) : [];
+    try {
+      if (typeof window !== 'undefined') {
+        const saved = localStorage.getItem('unitshift_favorites');
+        return saved ? JSON.parse(saved) : [];
+      }
+    } catch (e) {
+      return [];
     }
     return [];
   });
@@ -83,9 +115,13 @@ export default function App() {
 
   // Custom Units State
   const [customUnits, setCustomUnits] = useState<Record<string, Unit[]>>(() => {
-    if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('unitshift_custom_units');
-      return saved ? JSON.parse(saved) : {};
+    try {
+      if (typeof window !== 'undefined') {
+        const saved = localStorage.getItem('unitshift_custom_units');
+        return saved ? JSON.parse(saved) : {};
+      }
+    } catch (e) {
+      return {};
     }
     return {};
   });
@@ -196,6 +232,12 @@ export default function App() {
 
     setIsAiLoading(true);
     setAiResult(null);
+
+    if (!ai) {
+      setError("AI feature needs a GEMINI_API_KEY. Please set VITE_GEMINI_API_KEY in environment variables.");
+      setIsAiLoading(false);
+      return;
+    }
 
     try {
       const response = await ai.models.generateContent({
@@ -322,7 +364,7 @@ export default function App() {
     if (isNaN(val)) return;
 
     const newItem: HistoryItem = {
-      id: crypto.randomUUID(),
+      id: generateId(),
       fromValue: val,
       fromUnit,
       toValue: result,
@@ -665,7 +707,7 @@ export default function App() {
                   </button>
                   <button 
                     onClick={() => toggleFavorite({
-                      id: crypto.randomUUID(),
+                      id: generateId(),
                       fromValue: parseFloat(inputValue),
                       fromUnit,
                       toValue: result,
