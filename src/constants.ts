@@ -7,6 +7,7 @@ export interface Unit {
   label: string;
   value: string;
   ratio: number; // Ratio to base unit (e.g. for length, base is meters)
+  symbol?: string;
   description?: string;
 }
 

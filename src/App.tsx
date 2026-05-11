@@ -31,7 +31,6 @@ import {
   Zap
 } from 'lucide-react';
 import { CATEGORIES, convertValue, HistoryItem, Category, Unit } from './constants';
-import { GoogleGenAI, Type } from "@google/genai";
 
 // Extension for Web Speech API
 declare global {
@@ -51,19 +50,56 @@ const ICON_MAP: Record<string, any> = {
   Zap
 };
 
-// Initialize Gemini API safely
-const getAiInstance = () => {
-  try {
-    const key = import.meta.env.VITE_GEMINI_API_KEY || (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '');
-    if (!key || key === "MY_GEMINI_API_KEY" || !key.trim()) return null;
-    return new GoogleGenAI({ apiKey: key });
-  } catch (e) {
-    console.error("Failed to initialize AI instance:", e);
-    return null;
-  }
-};
+// Local Smart Parser - Replaces Gemini AI with local logic
+const smartParseQuery = (query: string, allCats: Category[]) => {
+  const q = query.toLowerCase().trim();
+  
+  // Pattern 1: Look for "5 km to miles" or "convert 10 kg in lbs"
+  const conversionRegex = /^(?:convert\s+)?(-?\d*\.?\d+)\s*(.*?)\s+(?:to|in|into)\s+(.*)$/i;
+  const match = q.match(conversionRegex);
 
-const ai = getAiInstance();
+  if (match) {
+    const value = parseFloat(match[1]);
+    const fromStr = match[2].trim();
+    const toStr = match[3].trim();
+
+    // Search for matching units across all categories
+    for (const cat of allCats) {
+      const fromUnit = cat.units.find(u => 
+        u.value.toLowerCase() === fromStr || 
+        u.label.toLowerCase().includes(fromStr) ||
+        (u.symbol && u.symbol.toLowerCase() === fromStr)
+      );
+      const toUnit = cat.units.find(u => 
+        u.value.toLowerCase() === toStr || 
+        u.label.toLowerCase().includes(toStr) ||
+        (u.symbol && u.symbol.toLowerCase() === toStr)
+      );
+
+      if (fromUnit && toUnit) {
+        return {
+          category: cat.id,
+          fromUnit: fromUnit.value,
+          toUnit: toUnit.value,
+          value,
+          explanation: `Locally parsed: ${value} ${fromUnit.label.split('(')[0]} to ${toUnit.label.split('(')[0]}`
+        };
+      }
+    }
+  }
+
+  // Pattern 2: Search for category names
+  for (const cat of allCats) {
+    if (q.includes(cat.label.toLowerCase()) || q.includes(cat.id)) {
+      return {
+        category: cat.id,
+        explanation: `Switched to ${cat.label} category based on your search.`
+      };
+    }
+  }
+
+  return null;
+};
 
 const generateId = () => {
   try {
@@ -154,11 +190,11 @@ export default function App() {
     }
   }, [activeCategory, fromUnit, toUnit]);
 
-  // AI & Voice States
-  const [aiQuery, setAiQuery] = useState('');
-  const [isAiLoading, setIsAiLoading] = useState(false);
+  // Smart Search States
+  const [appQuery, setAppQuery] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
   const [isListening, setIsListening] = useState(false);
-  const [aiResult, setAiResult] = useState<{
+  const [smartResult, setSmartResult] = useState<{
     category?: string;
     fromUnit?: string;
     toUnit?: string;
@@ -184,9 +220,9 @@ export default function App() {
 
     recognition.onresult = (event: any) => {
       const transcript = event.results[event.results.length - 1][0].transcript;
-      setAiQuery(transcript);
+      setAppQuery(transcript);
       // Automatically trigger conversion
-      processAiQuery(undefined, transcript);
+      processSmartQuery(undefined, transcript);
     };
 
     recognition.start();
@@ -206,6 +242,7 @@ export default function App() {
       label: `${newUnit.label} (${newUnit.symbol})`,
       value: newUnit.symbol.toLowerCase().trim(),
       ratio: ratioNum,
+      symbol: newUnit.symbol.toLowerCase().trim(),
       description: 'User-defined custom unit.'
     };
 
@@ -225,69 +262,35 @@ export default function App() {
     }));
   };
 
-  const processAiQuery = async (e?: React.FormEvent, overrideQuery?: string) => {
+  const processSmartQuery = async (e?: React.FormEvent, overrideQuery?: string) => {
     if (e) e.preventDefault();
-    const queryToProcess = overrideQuery || aiQuery;
+    const queryToProcess = overrideQuery || appQuery;
     if (!queryToProcess.trim()) return;
 
-    setIsAiLoading(true);
-    setAiResult(null);
+    setIsProcessing(true);
+    setSmartResult(null);
 
-    if (!ai) {
-      setError("AI feature needs a GEMINI_API_KEY. Please set VITE_GEMINI_API_KEY in environment variables.");
-      setIsAiLoading(false);
-      return;
-    }
+    // Using the local smart parser
+    const data = smartParseQuery(queryToProcess, allCategories);
+    
+    if (data) {
+      setSmartResult(data);
 
-    try {
-      const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: `User wants to convert units or ask about units. Query: "${queryToProcess}"
-        
-        Available Units Context:
-        ${CATEGORIES.map(c => `${c.label} (${c.id}): ${c.units.map(u => u.label + ' [' + u.value + ']').join(', ')}`).join('\n')}
-        
-        Task:
-        1. If it's a specific conversion request (e.g. "5m to ft"), parse numerical value, category ID, source unit key, and target unit key.
-        2. Provide a brief (1 sentence) explanation, comparison, or fun fact about the unit or conversion.
-        3. Map the units strictly to the valid 'value' keys provided in context.`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              category: { type: Type.STRING, description: "The ID of the category" },
-              fromUnit: { type: Type.STRING, description: "The source unit key" },
-              toUnit: { type: Type.STRING, description: "The target unit key" },
-              value: { type: Type.NUMBER, description: "The numeric value to convert" },
-              explanation: { type: Type.STRING, description: "A brief fun fact or context." }
-            },
-            required: ["explanation"]
-          }
-        }
-      });
-
-      const text = response.text;
-      if (text) {
-        const data = JSON.parse(text);
-        setAiResult(data);
-
-        // Automatically apply conversion if data is valid
-        if (data.category && data.fromUnit && data.toUnit) {
-          const cat = allCategories.find(c => c.id === data.category);
-          if (cat) {
-            setActiveCategoryId(cat.id);
-            setFromUnit(data.fromUnit);
-            setToUnit(data.toUnit);
-            if (data.value !== undefined) setInputValue(data.value.toString());
-          }
+      // Automatically apply conversion if data is valid
+      if (data.category) {
+        const cat = allCategories.find(c => c.id === data.category);
+        if (cat) {
+          setActiveCategoryId(cat.id);
+          if (data.fromUnit) setFromUnit(data.fromUnit);
+          if (data.toUnit) setToUnit(data.toUnit);
+          if (data.value !== undefined) setInputValue(data.value.toString());
         }
       }
-    } catch (err) {
-      console.error("AI Error:", err);
-    } finally {
-      setIsAiLoading(false);
+    } else {
+      setError("Couldn't parse that request. Try '5 miles to km'.");
     }
+    
+    setIsProcessing(false);
   };
 
   const handleInputChange = (val: string) => {
@@ -419,20 +422,20 @@ export default function App() {
           <div className="space-y-1">
             <h1 className="text-3xl font-semibold tracking-tight flex items-center gap-2">
               UnitShift
-              <span className="text-xs px-2 py-1 rounded-full bg-accent/10 text-accent font-bold uppercase tracking-widest">v2 AI</span>
+              <span className="text-xs px-2 py-1 rounded-full bg-accent/10 text-accent font-bold uppercase tracking-widest">v2 Local</span>
             </h1>
-            <p className="text-sm text-slate-500 dark:text-slate-400">Minimal conversion for the modern professional.</p>
+            <p className="text-sm text-slate-500 dark:text-slate-400">Precision conversion for the modern professional.</p>
           </div>
           <div className="flex items-center gap-3">
-            <form onSubmit={processAiQuery} className="relative group flex-1 md:flex-none">
+            <form onSubmit={processSmartQuery} className="relative group flex-1 md:flex-none">
               <div className="absolute inset-y-0 left-4 flex items-center pointer-events-none text-slate-400 group-focus-within:text-accent transition-colors">
                 <Search size={16} />
               </div>
               <input 
                 type="text"
                 placeholder="Convert '5 miles to km'..."
-                value={aiQuery}
-                onChange={(e) => setAiQuery(e.target.value)}
+                value={appQuery}
+                onChange={(e) => setAppQuery(e.target.value)}
                 className="w-full md:w-64 pl-10 pr-20 py-3 rounded-2xl bg-white dark:bg-slate-800 border border-slate-100 dark:border-slate-700 shadow-sm focus:ring-2 focus:ring-accent outline-none text-sm transition-all placeholder:text-slate-400"
               />
               <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
@@ -445,10 +448,10 @@ export default function App() {
                 </button>
                 <button 
                   type="submit"
-                  disabled={isAiLoading || !aiQuery.trim()}
+                  disabled={isProcessing || !appQuery.trim()}
                   className="p-2 rounded-xl text-accent hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-50 transition-all"
                 >
-                  {isAiLoading ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
+                  {isProcessing ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
                 </button>
               </div>
             </form>
@@ -462,9 +465,9 @@ export default function App() {
           </div>
         </header>
 
-        {/* AI Insight Card */}
+        {/* Smart Insight Card */}
         <AnimatePresence>
-          {aiResult?.explanation && (
+          {smartResult?.explanation && (
             <motion.div 
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
@@ -475,13 +478,13 @@ export default function App() {
                 <Info size={16} />
               </div>
               <div className="space-y-1 py-1">
-                <p className="text-sm font-medium text-slate-700 dark:text-slate-200">AI Insight</p>
+                <p className="text-sm font-medium text-slate-700 dark:text-slate-200">Processing Insight</p>
                 <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed italic">
-                  "{aiResult.explanation}"
+                  "{smartResult.explanation}"
                 </p>
               </div>
               <button 
-                onClick={() => setAiResult(null)}
+                onClick={() => setSmartResult(null)}
                 className="ml-auto text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors"
               >
                 <Trash2 size={14} />
