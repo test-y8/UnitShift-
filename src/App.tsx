@@ -54,7 +54,10 @@ const ICON_MAP: Record<string, any> = {
 // Initialize Gemini API safely
 const getAiInstance = () => {
   try {
-    const key = process.env.GEMINI_API_KEY;
+    // Vite replaces process.env.GEMINI_API_KEY during build
+    // We use a fallback string to prevent crashes if it's not defined
+    const key = (process.env as any).GEMINI_API_KEY || '';
+                
     if (!key || key === "MY_GEMINI_API_KEY" || !key.trim()) return null;
     return new GoogleGenAI({ apiKey: key });
   } catch (e) {
@@ -65,109 +68,50 @@ const getAiInstance = () => {
 
 const ai = getAiInstance();
 
-// Local Smart Parser - Replaces Gemini AI with local logic
-const smartParseQuery = (query: string, allCats: Category[]) => {
+// Basic Offline Parser - Simple and robust
+const offlineParseQuery = (query: string, allCats: Category[]) => {
   const q = query.toLowerCase().trim().replace(/[?!,.]$/, '');
   const normalize = (s: string) => s.toLowerCase().replace(/s$/, '').trim();
 
-  // 1. Identify Target Unit First (searching from the end usually helps)
-  const splitters = [/\s+(?:to|in|into|as)\s+/, /\s*=\s*/, /\s+is\s+/, /how many (.*?) in (.*)/i];
-  let left = '';
-  let right = '';
-  
-  // Try "How many X in Y" pattern specifically
-  const howManyMatch = q.match(/^how\s+many\s+(.*?)\s+(?:are\s+)?in\s+(.*)$/i);
-  if (howManyMatch) {
-    right = howManyMatch[1].trim();
-    left = howManyMatch[2].trim();
-  } else {
-    for (const s of splitters) {
-      const parts = q.split(s);
-      if (parts.length >= 2) {
-        // Everything before the last splitter is the source
-        left = parts.slice(0, -1).join(' ').trim();
-        right = parts[parts.length - 1].trim();
-        break;
-      }
-    }
-  }
+  // Pattern: "5 km to miles" or "10 kg in lbs"
+  const patterns = [
+    /^(?:convert\s+)?(-?\d*\.?\d+)\s*(.*?)\s+(?:to|in|into)\s+(.*)$/i,
+    /^(-?\d*\.?\d+)\s*(.*?)\s*(?:=|\bis\b)\s*(.*)$/i
+  ];
 
-  if (left && right) {
-    // 2. Identify the target category and unit
-    let targetUnit: Unit | null = null;
-    let targetCat: Category | null = null;
+  for (const regex of patterns) {
+    const match = q.match(regex);
+    if (match) {
+      const val = parseFloat(match[1]);
+      const fromStr = normalize(match[2]);
+      const toStr = normalize(match[3]);
 
-    for (const cat of allCats) {
-      const found = cat.units.find(u => 
-        normalize(u.value) === normalize(right) || 
-        normalize(u.label).includes(normalize(right)) ||
-        (u.symbol && normalize(u.symbol) === normalize(right))
-      );
-      if (found) {
-        targetUnit = found;
-        targetCat = cat;
-        break;
-      }
-    }
+      if (isNaN(val)) continue;
 
-    if (targetCat && targetUnit) {
-      // 3. Scan the Left side for multiple value-unit pairs in this category
-      // Look for patterns like "5 feet", "6 inches", "10kg", etc.
-      const chunkRegex = /(-?\d*\.?\d+)\s*([a-zA-Z%°Åµ]*)/g;
-      let m;
-      let totalValueInBase = 0;
-      const parsedFound: { val: number; unit: Unit }[] = [];
+      for (const cat of allCats) {
+        const findUnit = (str: string) => cat.units.find(u => 
+          normalize(u.value) === str || 
+          normalize(u.label).includes(str) ||
+          (u.symbol && normalize(u.symbol) === str)
+        );
 
-      while ((m = chunkRegex.exec(left)) !== null) {
-        const val = parseFloat(m[1]);
-        const unitStr = m[2].trim();
-        if (!isNaN(val)) {
-          const unit = targetCat.units.find(u => 
-            normalize(u.value) === normalize(unitStr) || 
-            normalize(u.label).includes(normalize(unitStr)) ||
-            (u.symbol && normalize(u.symbol) === normalize(unitStr))
-          );
-          
-          if (unit) {
-            // Temperature is special
-            if (targetCat.id === 'temperature') {
-              let cVal = val;
-              if (unit.value === 'f') cVal = (val - 32) * (5 / 9);
-              if (unit.value === 'k') cVal = val - 273.15;
-              if (unit.value === 'r') cVal = (val - 491.67) * (5 / 9);
-              totalValueInBase = cVal; // Temps don't sum, we just take the last one found
-            } else {
-              totalValueInBase += val * unit.ratio;
-            }
-            parsedFound.push({ val, unit });
-          }
+        const fromUnit = findUnit(fromStr);
+        const toUnit = findUnit(toStr);
+
+        if (fromUnit && toUnit) {
+          return {
+            category: cat.id,
+            fromUnit: fromUnit.value,
+            toUnit: toUnit.value,
+            value: val,
+            explanation: `Offline: ${val} ${fromUnit.label.split('(')[0].trim()} → ${toUnit.label.split('(')[0].trim()}`
+          };
         }
       }
-
-      if (parsedFound.length > 0) {
-        // Result: Convert from base to target
-        const finalValue = targetCat.id === 'temperature' 
-          ? totalValueInBase // Temperate base is handled in convertValue
-          : totalValueInBase / (targetCat.units.find(u => u.value === targetCat?.baseUnit)?.ratio || 1);
-
-        // If multi-unit, provide an explanation and set state to base unit
-        const displaySource = parsedFound.map(p => `${p.val} ${p.unit.label.split('(')[0].trim()}`).join(' + ');
-        
-        return {
-          category: targetCat.id,
-          // If only one unit found, use it. If multiple, use the first one and adjust value for state UI
-          fromUnit: parsedFound[0].unit.value,
-          toUnit: targetUnit.value,
-          value: targetCat.id === 'temperature' 
-            ? parsedFound[0].val // Keep temp as is
-            : (totalValueInBase / parsedFound[0].unit.ratio), // Scale first unit value to match total
-          explanation: `Locally parsed: ${displaySource} → ${targetUnit.label.split('(')[0].trim()}`
-        };
-      }
     }
   }
 
-  // Fallback pattern for simple category search
+  // Fallback: Just switch category if name mentioned
   for (const cat of allCats) {
     if (q.includes(cat.label.toLowerCase()) || q.includes(cat.id)) {
       return {
@@ -386,9 +330,9 @@ export default function App() {
       }
     }
 
-    // Fallback to local if AI is not available or failed
+    // Fallback to offline if AI is not available or failed
     if (!data) {
-      data = smartParseQuery(queryToProcess, allCategories);
+      data = offlineParseQuery(queryToProcess, allCategories);
     }
     
     if (data) {
